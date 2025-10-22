@@ -11,14 +11,17 @@ import org.slf4j.LoggerFactory;
 public class CategoryMessageConsumer extends AbstractMessageConsumer<Category> {
     private static final Logger logger = LoggerFactory.getLogger(CategoryMessageConsumer.class);
 
+    public CategoryMessageConsumer(ConsumerBehavior behavior) {
+        super(Category.class, "queue.category", "consumer.category.interval", behavior);
+    }
+
     public CategoryMessageConsumer() {
-        super(Category.class, "queue.category", "consumer.category.interval");
+        this(ConsumerBehavior.SINGLE_READ); // Default to single-read behavior for backward compatibility
     }
 
     @Override
     protected void processMessage(Category category) {
         logger.info("Processing category message: {}", category.getName());
         // Add your category processing logic here
-        stop(); // Release the connection after processing
     }
 }

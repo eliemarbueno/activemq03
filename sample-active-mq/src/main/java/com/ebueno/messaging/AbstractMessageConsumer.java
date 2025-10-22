@@ -14,7 +14,7 @@ import java.io.StringReader;
  *
  * @param <T> Type of entity to be received
  */
-public abstract class AbstractMessageConsumer<T> implements Runnable {
+public abstract class AbstractMessageConsumer<T> implements Runnable, AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(AbstractMessageConsumer.class);
 
     protected final ActiveMQConfig config;
@@ -22,20 +22,79 @@ public abstract class AbstractMessageConsumer<T> implements Runnable {
     protected final String queueName;
     protected final long pollInterval;
     protected volatile boolean running = true;
+    protected final ConsumerBehavior behavior;
+    
+    private volatile Connection connection;
+    private volatile Session session;
+    private volatile MessageConsumer consumer;
+    private volatile Thread consumerThread;
 
-    protected AbstractMessageConsumer(Class<T> entityClass, String queueProperty, String intervalProperty) {
+    protected AbstractMessageConsumer(Class<T> entityClass, String queueProperty, String intervalProperty, ConsumerBehavior behavior) {
         this.config = ActiveMQConfig.getInstance();
         this.entityClass = entityClass;
         this.queueName = config.getProperty(queueProperty);
         this.pollInterval = config.getLongProperty(intervalProperty);
+        this.behavior = behavior;
+    }
+
+    /**
+     * Starts the message consumer in a new thread.
+     * For SINGLE_READ behavior, the thread will terminate after processing one message.
+     * For PERSISTENT behavior, the thread will continue until stop() is called.
+     */
+    public void start() {
+        if (consumerThread != null && consumerThread.isAlive()) {
+            logger.warn("Consumer already running");
+            return;
+        }
+        running = true;
+        consumerThread = new Thread(this);
+        consumerThread.start();
+        logger.info("Started {} consumer for queue: {}", 
+            behavior == ConsumerBehavior.SINGLE_READ ? "single-read" : "persistent", 
+            queueName);
+    }
+
+    /**
+     * Closes all JMS resources and ensures proper cleanup
+     */
+    @Override
+    public synchronized void close() {
+        running = false;
+        logger.info("Closing JMS resources for {} consumer on queue: {}", 
+            behavior == ConsumerBehavior.SINGLE_READ ? "single-read" : "persistent",
+            queueName);
+            
+        try {
+            if (consumer != null) {
+                consumer.close();
+                consumer = null;
+            }
+            if (session != null) {
+                session.close();
+                session = null;
+            }
+            if (connection != null) {
+                connection.close();
+                connection = null;
+            }
+            
+            // Wait for the consumer thread to finish
+            if (consumerThread != null && consumerThread.isAlive()) {
+                consumerThread.join(pollInterval);
+                if (consumerThread.isAlive()) {
+                    consumerThread.interrupt();
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Error closing JMS resources", e);
+        } finally {
+            consumerThread = null;
+        }
     }
 
     @Override
     public void run() {
-        Connection connection = null;
-        Session session = null;
-        MessageConsumer consumer = null;
-
         try {
             connection = config.createConnection();
             connection.start();
@@ -43,32 +102,44 @@ public abstract class AbstractMessageConsumer<T> implements Runnable {
             Queue queue = session.createQueue(queueName);
             consumer = session.createConsumer(queue);
 
-            while (running) {
+            if (behavior == ConsumerBehavior.SINGLE_READ) {
+                // For SINGLE_READ, receive only one message and close immediately
                 Message message = consumer.receive(pollInterval);
                 if (message instanceof TextMessage) {
                     String xmlContent = ((TextMessage) message).getText();
                     T entity = convertFromXml(xmlContent);
                     processMessage(entity);
                 }
+                running = false;
+                close(); // Close resources immediately after processing
+            } else {
+                // For PERSISTENT, maintain the receiving loop
+                while (running) {
+                    Message message = consumer.receive(pollInterval);
+                    if (message instanceof TextMessage) {
+                        String xmlContent = ((TextMessage) message).getText();
+                        T entity = convertFromXml(xmlContent);
+                        processMessage(entity);
+                    }
+                }
             }
         } catch (JMSException | JAXBException e) {
             logger.error("Error processing message", e);
         } finally {
-            try {
-                if (consumer != null) consumer.close();
-                if (session != null) session.close();
-                if (connection != null) connection.close();
-            } catch (JMSException e) {
-                logger.error("Error closing JMS resources", e);
+            if (behavior == ConsumerBehavior.SINGLE_READ || !running) {
+                close();
             }
         }
     }
 
     /**
-     * Stop the consumer.
+     * Stop the consumer and close all resources.
      */
-    public void stop() {
-        running = false;
+    public synchronized void stop() {
+        if (running) {
+            running = false;
+            close();
+        }
     }
 
     /**
@@ -78,6 +149,7 @@ public abstract class AbstractMessageConsumer<T> implements Runnable {
      * @return Converted entity
      * @throws JAXBException if conversion fails
      */
+    @SuppressWarnings("unchecked")
     protected T convertFromXml(String xmlContent) throws JAXBException {
         JAXBContext context = JAXBContext.newInstance(entityClass);
         return (T) context.createUnmarshaller().unmarshal(new StringReader(xmlContent));

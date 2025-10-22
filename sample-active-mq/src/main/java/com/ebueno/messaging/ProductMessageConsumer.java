@@ -11,8 +11,12 @@ import org.slf4j.LoggerFactory;
 public class ProductMessageConsumer extends AbstractMessageConsumer<Product> {
     private static final Logger logger = LoggerFactory.getLogger(ProductMessageConsumer.class);
 
+    public ProductMessageConsumer(ConsumerBehavior behavior) {
+        super(Product.class, "queue.product", "consumer.product.interval", behavior);
+    }
+
     public ProductMessageConsumer() {
-        super(Product.class, "queue.product", "consumer.product.interval");
+        this(ConsumerBehavior.PERSISTENT); // Default to persistent behavior
     }
 
     @Override
